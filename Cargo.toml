@@ -1,0 +1,12 @@
+[package]
+name = "openclaw-mesh"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal mesh visualizer for OpenClaw grid nodes"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
