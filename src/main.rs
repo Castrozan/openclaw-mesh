@@ -300,6 +300,23 @@ impl App {
                 .join(&agent.id)
                 .join("sessions/sessions.json");
 
+            // Also check transcript file mtimes — they update during tool calls
+            let sessions_dir = openclaw_dir
+                .join("agents")
+                .join(&agent.id)
+                .join("sessions");
+            let newest_transcript_ms = std::fs::read_dir(&sessions_dir)
+                .ok()
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false))
+                        .filter_map(|e| e.metadata().ok()?.modified().ok())
+                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+
             let (active_count, total_sessions, total_tokens) = if let Ok(data) = std::fs::read_to_string(&sessions_path) {
                 if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&data) {
                     let mut active = 0u32;
@@ -311,7 +328,10 @@ impl App {
                         let tok = val.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0);
                         count += 1;
                         tokens += tok;
-                        if now_ms.saturating_sub(updated) < active_threshold_ms { active += 1; }
+                        // Active if session updated recently OR transcript written recently
+                        let recently_active = now_ms.saturating_sub(updated) < active_threshold_ms
+                            || now_ms.saturating_sub(newest_transcript_ms) < active_threshold_ms;
+                        if recently_active { active += 1; }
                     }
                     (active, count, tokens)
                 } else { (0, 0, 0) }
@@ -346,13 +366,7 @@ impl App {
 
         let ssh_result = Command::new("ssh")
             .args(["-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "lucas.zanoni@100.127.240.60",
-                "python3 -c \"import json,sys,os,time; now=time.time()*1000; \
-                agents=['robson','jenny','monster','silver']; \
-                result={}; \
-                [result.update({a: dict(active=sum(1 for k,v in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).items() if ':run:' not in k and now-v.get('updatedAt',0)<300000), \
-                total=sum(1 for k in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).keys() if ':run:' not in k), \
-                tokens=sum(v.get('totalTokens',0) for k,v in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).items() if ':run:' not in k))}) for a in agents if os.path.exists(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))]; \
-                print(json.dumps(result))\""])
+                "python3 -c \"\nimport json,os,time,glob\nnow=time.time()*1000\nagents=['robson','jenny','monster','silver']\nresult={}\nfor a in agents:\n  sp=os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json')\n  if not os.path.exists(sp): continue\n  d=json.load(open(sp))\n  sd=os.path.dirname(sp)\n  jfiles=glob.glob(os.path.join(sd,'*.jsonl'))\n  newest_mtime=max((os.path.getmtime(f) for f in jfiles),default=0)*1000\n  active=0;total=0;tokens=0\n  for k,v in d.items():\n    if ':run:' in k: continue\n    total+=1\n    tokens+=v.get('totalTokens',0)\n    updated=v.get('updatedAt',0)\n    if now-updated<300000 or now-newest_mtime<300000: active+=1\n  result[a]=dict(active=active,total=total,tokens=tokens)\nprint(json.dumps(result))\n\""])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
