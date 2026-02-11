@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::{
     io::stdout,
     process::Command,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -69,6 +69,13 @@ struct AgentsListEntry {
     model: Option<String>,
 }
 
+#[derive(Clone)]
+struct PollResult {
+    agents: Vec<AgentNode>,
+    gateway_online: bool,
+    status_message: String,
+}
+
 struct App {
     agents: Vec<AgentNode>,
     edges: Vec<(usize, usize)>,
@@ -85,6 +92,8 @@ struct App {
     target_pitch_speed: f64,
     direction_timer: u64,
     work_online: Arc<AtomicBool>,
+    poll_result: Arc<Mutex<Option<PollResult>>>,
+    polling: Arc<AtomicBool>,
 }
 
 impl App {
@@ -105,6 +114,8 @@ impl App {
             target_pitch_speed: 0.005,
             direction_timer: 0,
             work_online: Arc::new(AtomicBool::new(false)),
+            poll_result: Arc::new(Mutex::new(None)),
+            polling: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -196,16 +207,62 @@ impl App {
         }
     }
 
-    fn poll_data(&mut self) {
+    fn start_poll(&mut self) {
+        if self.polling.load(Ordering::Relaxed) {
+            return;
+        }
+        self.polling.store(true, Ordering::Relaxed);
+        self.last_poll = Instant::now();
+
+        let result_slot = self.poll_result.clone();
+        let polling_flag = self.polling.clone();
+
+        std::thread::spawn(move || {
+            let poll_result = Self::do_poll();
+            if let Ok(mut slot) = result_slot.lock() {
+                *slot = Some(poll_result);
+            }
+            polling_flag.store(false, Ordering::Relaxed);
+        });
+    }
+
+    fn apply_poll(&mut self) {
+        let result = if let Ok(mut slot) = self.poll_result.lock() {
+            slot.take()
+        } else {
+            None
+        };
+
+        if let Some(result) = result {
+            let old_count = self.agents.len();
+
+            // Preserve pulse_phase and pos3d from existing agents
+            let mut new_agents = result.agents;
+            for new_agent in &mut new_agents {
+                if let Some(existing) = self.agents.iter().find(|a| a.id == new_agent.id) {
+                    new_agent.pulse_phase = existing.pulse_phase;
+                    new_agent.pos3d = existing.pos3d;
+                }
+            }
+
+            self.gateway_online = result.gateway_online;
+            self.status_message = result.status_message;
+            self.agents = new_agents;
+
+            if old_count != self.agents.len() {
+                self.distribute_3d_positions();
+            }
+        }
+    }
+
+    fn do_poll() -> PollResult {
         let openclaw_dir = dirs::home_dir()
             .map(|h| h.join(".openclaw"))
             .unwrap_or_default();
 
-        // Read agents list from cached config (avoid CLI call)
         let config_path = openclaw_dir.join("openclaw.json");
         let local_agents: Vec<AgentsListEntry> = if let Ok(data) = std::fs::read_to_string(&config_path) {
             if let Ok(config) = serde_json::from_str::<serde_json::Value>(&data) {
-                self.gateway_online = true;
                 if let Some(list) = config.get("agents").and_then(|a| a.get("list")).and_then(|l| l.as_array()) {
                     list.iter().filter_map(|entry| {
                         let id = entry.get("id").and_then(|v| v.as_str())?;
@@ -222,10 +279,11 @@ impl App {
                 } else { vec![] }
             } else { vec![] }
         } else {
-            self.gateway_online = false;
-            self.status_message = "config not found".into();
-            self.last_poll = Instant::now();
-            return;
+            return PollResult {
+                agents: vec![],
+                gateway_online: false,
+                status_message: "config not found".into(),
+            };
         };
 
         let now_ms = std::time::SystemTime::now()
@@ -235,7 +293,6 @@ impl App {
         let active_threshold_ms = ACTIVE_THRESHOLD_MINUTES * 60 * 1000;
 
         let mut new_agents: Vec<AgentNode> = vec![];
-        let old_count = self.agents.len();
 
         for agent in &local_agents {
             let sessions_path = openclaw_dir
@@ -260,42 +317,32 @@ impl App {
                 } else { (0, 0, 0) }
             } else { (0, 0, 0) };
 
-            let active = active_count > 0;
-            let existing = self.agents.iter().find(|n| n.id == agent.id);
-            let pulse_phase = existing.map(|n| n.pulse_phase).unwrap_or(0.0);
-            let pos3d = existing.map(|n| n.pos3d).unwrap_or([0.0; 3]);
-
             new_agents.push(AgentNode {
                 id: agent.id.clone(),
                 label: agent.identity_name.clone().unwrap_or_else(|| agent.id.clone()),
                 emoji: agent.identity_emoji.clone().unwrap_or_else(|| "🤖".into()),
                 model: short_model(agent.model.as_deref().unwrap_or("unknown")),
-                active,
+                active: active_count > 0,
                 active_sessions: active_count,
                 total_sessions,
                 total_tokens,
                 kind: AgentKind::Local,
-                pos3d,
+                pos3d: [0.0; 3],
                 screen_x: 0.0,
                 screen_y: 0.0,
                 screen_depth: 0.0,
-                pulse_phase,
+                pulse_phase: 0.0,
                 is_local: true,
             });
         }
 
-        // Grid agents (work machine via SSH)
+        // Grid agents via SSH
         let grid_agents_meta = vec![
             ("robson", "⚽", "sonnet-4.5"),
             ("jenny", "🎀", "kimi-k2.5"),
             ("monster", "👾", "kimi-k2.5"),
             ("silver", "🪙", "kimi-k2.5"),
         ];
-
-        // SSH to work machine and get session freshness (background-cached)
-        let work_flag = self.work_online.clone();
-        let grid_data = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, (u32, u32, u64)>::new()));
-        let grid_data_clone = grid_data.clone();
 
         let ssh_result = Command::new("ssh")
             .args(["-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "lucas.zanoni@100.127.240.60",
@@ -312,18 +359,15 @@ impl App {
             .output();
 
         let mut remote_data: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
-        match ssh_result {
-            Ok(out) if out.status.success() => {
-                work_flag.store(true, Ordering::Relaxed);
-                if let Ok(data) = serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&out.stdout) {
+        let mut work_online = false;
+        if let Ok(out) = ssh_result {
+            if out.status.success() {
+                work_online = true;
+                if let Ok(data) = serde_json::from_slice(&out.stdout) {
                     remote_data = data;
                 }
             }
-            _ => {
-                work_flag.store(false, Ordering::Relaxed);
-            }
         }
-        let work_online = self.work_online.load(Ordering::Relaxed);
 
         for (agent_id, emoji, model) in &grid_agents_meta {
             let (active_count, total_sessions, total_tokens) = if let Some(info) = remote_data.get(*agent_id) {
@@ -336,26 +380,21 @@ impl App {
                 (0, 0, 0)
             };
 
-            let active = active_count > 0;
-            let existing = self.agents.iter().find(|n| n.id == *agent_id);
-            let pulse_phase = existing.map(|n| n.pulse_phase).unwrap_or(0.0);
-            let pos3d = existing.map(|n| n.pos3d).unwrap_or([0.0; 3]);
-
             new_agents.push(AgentNode {
                 id: agent_id.to_string(),
                 label: agent_id.to_string(),
                 emoji: emoji.to_string(),
                 model: model.to_string(),
-                active,
+                active: active_count > 0,
                 active_sessions: active_count,
                 total_sessions,
                 total_tokens,
                 kind: AgentKind::Grid,
-                pos3d,
+                pos3d: [0.0; 3],
                 screen_x: 0.0,
                 screen_y: 0.0,
                 screen_depth: 0.0,
-                pulse_phase,
+                pulse_phase: 0.0,
                 is_local: false,
             });
         }
@@ -363,16 +402,12 @@ impl App {
         let active_count = new_agents.iter().filter(|a| a.active).count();
         let total_count = new_agents.len();
         let work_status = if work_online { "work ⚡" } else { "work ⊘" };
-        self.status_message = format!("{}/{} active │ {}", active_count, total_count, work_status);
 
-        let needs_layout = old_count != new_agents.len();
-        self.agents = new_agents;
-
-        if needs_layout {
-            self.distribute_3d_positions();
+        PollResult {
+            agents: new_agents,
+            gateway_online: true,
+            status_message: format!("{}/{} active │ {}", active_count, total_count, work_status),
         }
-
-        self.last_poll = Instant::now();
     }
 
     fn update(&mut self, screen_width: f64, screen_height: f64) {
@@ -605,8 +640,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         if app.last_poll.elapsed() >= POLL_INTERVAL {
-            app.poll_data();
+            app.start_poll();
         }
+        app.apply_poll();
 
         let size = terminal.size()?;
         app.update(size.width as f64, size.height as f64 * 2.0);
@@ -629,6 +665,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('r') => {
                             app.last_poll = Instant::now() - POLL_INTERVAL - Duration::from_secs(1);
+                            app.polling.store(false, Ordering::Relaxed);
                         }
                         _ => {}
                     }
