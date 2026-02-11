@@ -284,27 +284,59 @@ impl App {
             });
         }
 
-        // Grid agents (work machine)
-        let grid_agents = vec![
-            ("robson", "⚽", "sonnet-4.5", true),
-            ("jenny", "🎀", "kimi-k2.5", false),
-            ("monster", "👾", "kimi-k2.5", false),
-            ("silver", "🪙", "kimi-k2.5", false),
+        // Grid agents (work machine via SSH)
+        let grid_agents_meta = vec![
+            ("robson", "⚽", "sonnet-4.5"),
+            ("jenny", "🎀", "kimi-k2.5"),
+            ("monster", "👾", "kimi-k2.5"),
+            ("silver", "🪙", "kimi-k2.5"),
         ];
 
-        // Check work gateway in background (non-blocking)
+        // SSH to work machine and get session freshness (background-cached)
         let work_flag = self.work_online.clone();
-        std::thread::spawn(move || {
-            let online = std::net::TcpStream::connect_timeout(
-                &"100.127.240.60:18790".parse().unwrap(),
-                Duration::from_millis(800),
-            ).is_ok();
-            work_flag.store(online, Ordering::Relaxed);
-        });
+        let grid_data = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, (u32, u32, u64)>::new()));
+        let grid_data_clone = grid_data.clone();
+
+        let ssh_result = Command::new("ssh")
+            .args(["-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "lucas.zanoni@100.127.240.60",
+                "python3 -c \"import json,sys,os,time; now=time.time()*1000; \
+                agents=['robson','jenny','monster','silver']; \
+                result={}; \
+                [result.update({a: dict(active=sum(1 for k,v in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).items() if ':run:' not in k and now-v.get('updatedAt',0)<600000), \
+                total=sum(1 for k in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).keys() if ':run:' not in k), \
+                tokens=sum(v.get('totalTokens',0) for k,v in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).items() if ':run:' not in k))}) for a in agents if os.path.exists(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))]; \
+                print(json.dumps(result))\""])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        let mut remote_data: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+        match ssh_result {
+            Ok(out) if out.status.success() => {
+                work_flag.store(true, Ordering::Relaxed);
+                if let Ok(data) = serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&out.stdout) {
+                    remote_data = data;
+                }
+            }
+            _ => {
+                work_flag.store(false, Ordering::Relaxed);
+            }
+        }
         let work_online = self.work_online.load(Ordering::Relaxed);
 
-        for (agent_id, emoji, model, is_default) in &grid_agents {
-            let active = work_online && *is_default;
+        for (agent_id, emoji, model) in &grid_agents_meta {
+            let (active_count, total_sessions, total_tokens) = if let Some(info) = remote_data.get(*agent_id) {
+                (
+                    info.get("active").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    info.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    info.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                )
+            } else {
+                (0, 0, 0)
+            };
+
+            let active = active_count > 0;
             let existing = self.agents.iter().find(|n| n.id == *agent_id);
             let pulse_phase = existing.map(|n| n.pulse_phase).unwrap_or(0.0);
             let pos3d = existing.map(|n| n.pos3d).unwrap_or([0.0; 3]);
@@ -315,9 +347,9 @@ impl App {
                 emoji: emoji.to_string(),
                 model: model.to_string(),
                 active,
-                active_sessions: if active { 1 } else { 0 },
-                total_sessions: 0,
-                total_tokens: 0,
+                active_sessions: active_count,
+                total_sessions,
+                total_tokens,
                 kind: AgentKind::Grid,
                 pos3d,
                 screen_x: 0.0,
