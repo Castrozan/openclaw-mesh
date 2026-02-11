@@ -21,7 +21,7 @@ use std::{
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const TICK_RATE: Duration = Duration::from_millis(33);
-const ACTIVE_THRESHOLD_MINUTES: u64 = 2;
+const ACTIVE_THRESHOLD_MINUTES: u64 = 5;
 const CAMERA_SPEED: f64 = 0.020;
 const CAMERA_DISTANCE: f64 = 8.0;
 
@@ -349,7 +349,7 @@ impl App {
                 "python3 -c \"import json,sys,os,time; now=time.time()*1000; \
                 agents=['robson','jenny','monster','silver']; \
                 result={}; \
-                [result.update({a: dict(active=sum(1 for k,v in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).items() if ':run:' not in k and now-v.get('updatedAt',0)<120000), \
+                [result.update({a: dict(active=sum(1 for k,v in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).items() if ':run:' not in k and now-v.get('updatedAt',0)<300000), \
                 total=sum(1 for k in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).keys() if ':run:' not in k), \
                 tokens=sum(v.get('totalTokens',0) for k,v in json.load(open(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))).items() if ':run:' not in k))}) for a in agents if os.path.exists(os.path.expanduser(f'~/.openclaw/agents/{a}/sessions/sessions.json'))]; \
                 print(json.dumps(result))\""])
