@@ -34,6 +34,7 @@ const COLOR_QUANTIZE_STEP: u8 = 8;
 
 fn default_color_local() -> Vec<u8> { vec![50, 255, 50] }
 fn default_color_grid() -> Vec<u8> { vec![50, 200, 255] }
+fn default_color_claude_discord() -> Vec<u8> { vec![180, 120, 255] }
 fn default_color_edge_active() -> Vec<u8> { vec![0, 255, 255] }
 fn default_color_edge_inactive() -> Vec<u8> { vec![0, 220, 240] }
 fn default_color_inactive_node() -> Vec<u8> { vec![40, 60, 40] }
@@ -58,9 +59,20 @@ fn default_edge_fade_strength() -> f64 { DEFAULT_EDGE_FADE_STRENGTH }
 fn default_connect_timeout_secs() -> u64 { DEFAULT_CONNECT_TIMEOUT_SECS }
 
 #[derive(Deserialize, Debug, Clone)]
+struct ClaudeDiscordAgentConfig {
+    id: String,
+    #[serde(default)]
+    emoji: String,
+    #[serde(default)]
+    model: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 struct MeshConfig {
     #[serde(default)]
     grid: Vec<GridAgentConfig>,
+    #[serde(default, rename = "claudeDiscord")]
+    claude_discord: Vec<ClaudeDiscordAgentConfig>,
     #[serde(default)]
     connections: ConnectionsConfig,
     #[serde(default)]
@@ -75,6 +87,7 @@ impl Default for MeshConfig {
     fn default() -> Self {
         Self {
             grid: vec![],
+            claude_discord: vec![],
             connections: ConnectionsConfig::default(),
             colors: ColorsConfig::default(),
             motion: MotionConfig::default(),
@@ -138,6 +151,8 @@ struct ColorsConfig {
     border: Vec<u8>,
     #[serde(default = "default_color_title")]
     title: Vec<u8>,
+    #[serde(default = "default_color_claude_discord", rename = "claudeDiscord")]
+    claude_discord_color: Vec<u8>,
 }
 
 impl Default for ColorsConfig {
@@ -155,6 +170,7 @@ impl Default for ColorsConfig {
             tokens: default_color_tokens(),
             border: default_color_border(),
             title: default_color_title(),
+            claude_discord_color: default_color_claude_discord(),
         }
     }
 }
@@ -269,6 +285,7 @@ struct AgentNode {
 enum AgentKind {
     Local,
     Grid,
+    ClaudeDiscord,
 }
 
 impl AgentKind {
@@ -276,6 +293,7 @@ impl AgentKind {
         match self {
             AgentKind::Local => rgb_from_vec(&config.local),
             AgentKind::Grid => rgb_from_vec(&config.grid),
+            AgentKind::ClaudeDiscord => rgb_from_vec(&config.claude_discord_color),
         }
     }
 }
@@ -357,18 +375,41 @@ impl App {
             return;
         }
 
-        let octahedron: Vec<[f64; 3]> = vec![
-            [ 0.0,  3.5,  0.0],
-            [ 0.0, -3.5,  0.0],
-            [ 3.5,  0.0,  0.0],
-            [-3.5,  0.0,  0.0],
-            [ 0.0,  0.0,  3.5],
-            [ 0.0,  0.0, -3.5],
+        let r = 3.5;
+        let preset_shapes: Vec<Vec<[f64; 3]>> = vec![
+            vec![[0.0, 0.0, 0.0]],
+            vec![[r, 0.0, 0.0], [-r, 0.0, 0.0]],
+            vec![
+                [0.0, r, 0.0],
+                [-r * 0.866, -r * 0.5, 0.0],
+                [ r * 0.866, -r * 0.5, 0.0],
+            ],
+            vec![
+                [ 0.0,    r * 0.816,  0.0],
+                [-r * 0.816, -r * 0.333, -r * 0.471],
+                [ r * 0.816, -r * 0.333, -r * 0.471],
+                [ 0.0,   -r * 0.333,  r * 0.943],
+            ],
+            vec![
+                [ 0.0,  r,  0.0],
+                [ 0.0, -r,  0.0],
+                [ r,  0.0,  0.0],
+                [-r,  0.0,  0.0],
+                [ 0.0,  0.0,  r],
+            ],
+            vec![
+                [ 0.0,  r,  0.0],
+                [ 0.0, -r,  0.0],
+                [ r,  0.0,  0.0],
+                [-r,  0.0,  0.0],
+                [ 0.0,  0.0,  r],
+                [ 0.0,  0.0, -r],
+            ],
         ];
 
         for (i, agent) in self.agents.iter_mut().enumerate() {
-            if i < octahedron.len() {
-                agent.pos3d = octahedron[i];
+            if count <= preset_shapes.len() && i < preset_shapes[count - 1].len() {
+                agent.pos3d = preset_shapes[count - 1][i];
             } else {
                 let golden_ratio = (1.0 + 5.0_f64.sqrt()) / 2.0;
                 let theta = std::f64::consts::TAU * i as f64 / golden_ratio;
@@ -524,22 +565,6 @@ impl App {
                 .join(&agent.id)
                 .join("sessions/sessions.json");
 
-            let sessions_dir = openclaw_dir
-                .join("agents")
-                .join(&agent.id)
-                .join("sessions");
-            let newest_transcript_ms = std::fs::read_dir(&sessions_dir)
-                .ok()
-                .map(|entries| {
-                    entries.filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false))
-                        .filter_map(|e| e.metadata().ok()?.modified().ok())
-                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
-                        .max()
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-
             let (active_count, total_sessions, total_tokens) = if let Ok(data) = std::fs::read_to_string(&sessions_path) {
                 if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&data) {
                     let mut active = 0u32;
@@ -551,9 +576,9 @@ impl App {
                         let tok = val.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0);
                         count += 1;
                         tokens += tok;
-                        let recently_active = now_ms.saturating_sub(updated) < active_threshold_ms
-                            || now_ms.saturating_sub(newest_transcript_ms) < active_threshold_ms;
-                        if recently_active { active += 1; }
+                        if now_ms.saturating_sub(updated) < active_threshold_ms {
+                            active += 1;
+                        }
                     }
                     (active, count, tokens)
                 } else { (0, 0, 0) }
@@ -594,9 +619,8 @@ impl App {
             let agent_list_str = agent_ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",");
 
             let python_script = format!(
-                "python3 -c \"\nimport json,os,time,glob\nnow=time.time()*1000\nagents=[{}]\nresult={{}}\nfor a in agents:\n  sp=os.path.expanduser(f'~/.openclaw/agents/{{a}}/sessions/sessions.json')\n  if not os.path.exists(sp): continue\n  d=json.load(open(sp))\n  sd=os.path.dirname(sp)\n  jfiles=glob.glob(os.path.join(sd,'*.jsonl'))\n  newest_mtime=max((os.path.getmtime(f) for f in jfiles),default=0)*1000\n  active=0;total=0;tokens=0\n  for k,v in d.items():\n    if ':run:' in k: continue\n    total+=1\n    tokens+=v.get('totalTokens',0)\n    updated=v.get('updatedAt',0)\n    if now-updated<{}000 or now-newest_mtime<{}000: active+=1\n  result[a]=dict(active=active,total=total,tokens=tokens)\nprint(json.dumps(result))\n\"",
+                "python3 -c \"\nimport json,os,time\nnow=time.time()*1000\nagents=[{}]\nresult={{}}\nfor a in agents:\n  sp=os.path.expanduser(f'~/.openclaw/agents/{{a}}/sessions/sessions.json')\n  if not os.path.exists(sp): continue\n  d=json.load(open(sp))\n  active=0;total=0;tokens=0\n  for k,v in d.items():\n    if ':run:' in k: continue\n    total+=1\n    tokens+=v.get('totalTokens',0)\n    updated=v.get('updatedAt',0)\n    if now-updated<{}000: active+=1\n  result[a]=dict(active=active,total=total,tokens=tokens)\nprint(json.dumps(result))\n\"",
                 agent_list_str,
-                active_threshold_ms / 1000,
                 active_threshold_ms / 1000,
             );
 
@@ -652,6 +676,41 @@ impl App {
             });
         }
 
+        let claude_discord_agents = &config.claude_discord;
+        if !claude_discord_agents.is_empty() {
+            let tmux_window_activity = detect_claude_discord_tmux_activity();
+            let claude_discord_active_threshold_secs = 60;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            for cd_agent in claude_discord_agents {
+                let is_active = tmux_window_activity
+                    .get(&cd_agent.id)
+                    .map(|&last_activity| now_secs.saturating_sub(last_activity) < claude_discord_active_threshold_secs)
+                    .unwrap_or(false);
+
+                new_agents.push(AgentNode {
+                    id: cd_agent.id.clone(),
+                    label: cd_agent.id.clone(),
+                    emoji: if cd_agent.emoji.is_empty() { "💬".into() } else { cd_agent.emoji.clone() },
+                    model: cd_agent.model.clone(),
+                    active: is_active,
+                    active_sessions: if is_active { 1 } else { 0 },
+                    total_sessions: if tmux_window_activity.contains_key(&cd_agent.id) { 1 } else { 0 },
+                    total_tokens: 0,
+                    kind: AgentKind::ClaudeDiscord,
+                    pos3d: [0.0; 3],
+                    screen_x: 0.0,
+                    screen_y: 0.0,
+                    screen_depth: 0.0,
+                    pulse_phase: 0.0,
+                    is_local: true,
+                });
+            }
+        }
+
         let active_count = new_agents.iter().filter(|a| a.active).count();
         let total_count = new_agents.len();
         let work_status = if work_online { "work ⚡" } else if has_ssh { "work ⊘" } else { "local only" };
@@ -693,12 +752,42 @@ impl App {
     }
 }
 
+fn detect_claude_discord_tmux_activity() -> std::collections::HashMap<String, u64> {
+    let mut activity_map = std::collections::HashMap::new();
+
+    let output = Command::new("tmux")
+        .args(["list-windows", "-t", "claude-discord", "-F", "#{window_name} #{window_activity}"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    let window_name = parts[0].to_string();
+                    if let Ok(activity_epoch) = parts[1].parse::<u64>() {
+                        activity_map.insert(window_name, activity_epoch);
+                    }
+                }
+            }
+        }
+    }
+
+    activity_map
+}
+
 fn short_model(model: &str) -> String {
     let name = model.split('/').last().unwrap_or(model);
     match name {
-        "claude-opus-4-6" => "opus-4".into(),
+        "claude-opus-4-6" | "opus" => "opus".into(),
         "claude-opus-4-5" => "opus-4.5".into(),
+        "claude-sonnet-4-6" | "sonnet" => "sonnet".into(),
         "claude-sonnet-4-5" => "sonnet-4.5".into(),
+        "claude-haiku-4-5" | "haiku" => "haiku".into(),
         "kimi-k2.5" => "kimi-k2.5".into(),
         other if other.len() > 14 => format!("{}…", &other[..13]),
         other => other.to_string(),
@@ -747,7 +836,7 @@ fn draw_mesh(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let config = &app.config;
 
     let title = format!(
-        " openclaw grid │ {} │ {} ",
+        " agent mesh │ {} │ {} ",
         if app.gateway_online { "⚡ online" } else { "⊘ offline" },
         app.status_message
     );
